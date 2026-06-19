@@ -1,7 +1,5 @@
 import streamlit as st
 import sqlparse
-from sqlparse.sql import Identifier, Function, Where, Parenthesis, IdentifierList
-from sqlparse.tokens import Keyword, DML
 from pygments import highlight
 from pygments.lexers import SqlLexer
 from pygments.formatters import HtmlFormatter
@@ -198,63 +196,77 @@ st.markdown("""
 
 
 def analyze_sql_complexity(sql_query):
-    """Analyze SQL query and return complexity metrics"""
-    parsed = sqlparse.parse(sql_query)[0]
-    
+    """Analyze SQL query and return approximate complexity metrics."""
+    normalized = re.sub(r"\s+", " ", sql_query).strip()
+    upper_sql = normalized.upper()
+
     metrics = {
-        'tables': set(),
-        'joins': 0,
-        'subqueries': 0,
-        'ctes': 0,
-        'columns': 0,
-        'where_conditions': 0
+        "tables": set(),
+        "joins": 0,
+        "subqueries": 0,
+        "ctes": 0,
+        "columns": 0,
+        "where_conditions": 0,
     }
-    
-    # Count CTEs
-    if sql_query.upper().startswith('WITH'):
-        metrics['ctes'] = sql_query.upper().count('WITH')
-    
-    # Extract tokens and analyze
-    def extract_tables_recursive(tokens):
-        for token in tokens:
-            if isinstance(token, Identifier):
-                # Check if it's a table reference (not a column)
-                if token.get_real_name():
-                    metrics['tables'].add(token.get_real_name())
-            elif isinstance(token, IdentifierList):
-                for identifier in token.get_identifiers():
-                    if isinstance(identifier, Identifier):
-                        metrics['tables'].add(identifier.get_real_name())
-            elif isinstance(token, Parenthesis):
-                # Subquery detection
-                sub_str = str(token).strip()
-                if sub_str.upper().startswith('(SELECT'):
-                    metrics['subqueries'] += 1
-                extract_tables_recursive(token.tokens)
-            elif token.ttype is Keyword and 'JOIN' in token.value.upper():
-                metrics['joins'] += 1
-            elif hasattr(token, 'tokens'):
-                extract_tables_recursive(token.tokens)
-    
-    extract_tables_recursive(parsed.tokens)
-    
-    # Count SELECT columns
-    select_found = False
-    for token in parsed.tokens:
-        if token.ttype is DML and token.value.upper() == 'SELECT':
-            select_found = True
-        elif select_found and isinstance(token, IdentifierList):
-            metrics['columns'] = len(list(token.get_identifiers()))
-            break
-        elif select_found and isinstance(token, Identifier):
-            metrics['columns'] = 1
-            break
-    
-    # Count WHERE conditions (approximate by AND/OR count)
-    where_clause = str(parsed).upper()
-    if 'WHERE' in where_clause:
-        metrics['where_conditions'] = where_clause.count(' AND ') + where_clause.count(' OR ') + 1
-    
+
+    # Track CTE names so we don't count them as physical tables.
+    cte_names = {
+        match.group(1).lower()
+        for match in re.finditer(r"(?:WITH|,)\s*([a-zA-Z_][\w$]*)\s+AS\s*\(", normalized, flags=re.IGNORECASE)
+    }
+    metrics["ctes"] = len(cte_names)
+
+    metrics["joins"] = len(
+        re.findall(r"\b(?:INNER|LEFT|RIGHT|FULL|CROSS)?\s*JOIN\b", upper_sql)
+    )
+    metrics["subqueries"] = len(re.findall(r"\(\s*SELECT\b", upper_sql))
+
+    for table_match in re.finditer(r"\b(?:FROM|JOIN)\s+([a-zA-Z_][\w.$]*)", normalized, flags=re.IGNORECASE):
+        raw_name = table_match.group(1).strip()
+        table_name = raw_name.split(".")[-1].lower()
+        if table_name not in cte_names:
+            metrics["tables"].add(table_name)
+
+    # Count top-level selected columns.
+    select_clause = ""
+    depth = 0
+    start = upper_sql.find("SELECT ")
+    if start >= 0:
+        i = start + len("SELECT ")
+        while i < len(normalized):
+            char = normalized[i]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+            if depth == 0 and normalized[i : i + 5].upper() == " FROM":
+                break
+            select_clause += char
+            i += 1
+
+    if select_clause.strip():
+        col_count = 1
+        depth = 0
+        for char in select_clause:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth = max(0, depth - 1)
+            elif char == "," and depth == 0:
+                col_count += 1
+        metrics["columns"] = col_count
+
+    where_match = re.search(
+        r"\bWHERE\b(.*?)(\bGROUP\s+BY\b|\bORDER\s+BY\b|\bHAVING\b|\bLIMIT\b|\bUNION\b|$)",
+        upper_sql,
+        flags=re.IGNORECASE,
+    )
+    if where_match:
+        where_body = where_match.group(1)
+        metrics["where_conditions"] = (
+            len(re.findall(r"\bAND\b|\bOR\b", where_body)) + 1
+        )
+
     return metrics
 
 
@@ -287,6 +299,19 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+
+def load_selected_sample():
+    selected = st.session_state.get("selected_sample", "Custom")
+    if selected == "Custom":
+        return
+    st.session_state["sql_input"] = SAMPLE_QUERIES[selected]
+
+
+if "selected_sample" not in st.session_state:
+    st.session_state["selected_sample"] = "Custom"
+if "sql_input" not in st.session_state:
+    st.session_state["sql_input"] = "SELECT * FROM users WHERE status = 'active'"
+
 # Layout
 col1, col2 = st.columns([1, 1])
 
@@ -294,23 +319,17 @@ with col1:
     st.subheader("📝 Input SQL")
     
     # Sample query selector
-    selected_sample = st.selectbox(
+    st.selectbox(
         "Try a sample query:",
         ["Custom"] + list(SAMPLE_QUERIES.keys()),
-        index=0
+        key="selected_sample",
+        on_change=load_selected_sample,
     )
-    
-    # Text area for SQL input
-    if selected_sample != "Custom":
-        default_query = SAMPLE_QUERIES[selected_sample]
-    else:
-        default_query = "SELECT * FROM users WHERE status = 'active'"
     
     sql_input = st.text_area(
         "Paste your SQL query:",
-        value=default_query,
+        key="sql_input",
         height=300,
-        key="sql_input"
     )
     
     if st.button("🚀 Format & Analyze", use_container_width=True):
